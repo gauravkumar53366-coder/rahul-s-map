@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Plot Map — Simple Area Measure</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  html,body,#map{height:100%;margin:0;padding:0;font-family:Arial,Helvetica,sans-serif}
+  #map{position:fixed;inset:0}
+  .menu-btn{position:absolute;right:12px;top:12px;z-index:1001;background:#111827;color:#fff;border:none;border-radius:10px;padding:10px 14px;cursor:pointer}
+  .sidebar{position:absolute;right:12px;top:60px;z-index:1000;width:320px;max-width:92vw;background:#fff;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.15);transform:translateX(110%);transition:transform .18s}
+  .sidebar.open{transform:translateX(0)}
+  .sb-header{padding:10px 12px;background:#111827;color:#fff;font-weight:700;border-top-left-radius:10px;border-top-right-radius:10px}
+  .sb-sec{padding:10px 12px;border-top:1px solid #eee;display:flex;flex-direction:column;gap:8px}
+  .row{display:flex;gap:8px;align-items:center}
+  .input{flex:1;padding:8px;border:1px solid #ddd;border-radius:8px}
+  .btn{padding:8px 10px;border-radius:8px;border:none;background:#2563eb;color:#fff;cursor:pointer}
+  .btn.gray{background:#6b7280}
+  .btn.outline{background:#fff;color:#111;border:1px solid #ddd}
+  .hint{font-size:12px;color:#666}
+  .plot-label{pointer-events:none;transform:translate(-50%,-50%)}
+  .plot-label div{background:rgba(255,255,255,0.95);padding:3px 6px;border-radius:6px;border:1px solid #e6e6e6;font-weight:700;color:#c62828;font-size:12px}
+  .toast{position:absolute;left:50%;top:10px;transform:translateX(-50%);z-index:1200;background:#111827;color:#fff;padding:8px 12px;border-radius:8px;display:none}
+  .measure-label{background:#111827;color:#fff;padding:6px 8px;border-radius:8px;font-size:13px}
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+<button id="menuBtn" class="menu-btn">☰ मेन्यू</button>
+
+<div id="sidebar" class="sidebar" aria-hidden="true">
+  <div class="sb-header">मैप विकल्प</div>
+
+  <div class="sb-sec">
+    <div class="row">
+      <input id="plotInput" class="input" placeholder="प्लॉट संख्या डालें (उदा. 1493)" />
+      <button id="searchBtn" class="btn">🔍</button>
+    </div>
+    <div class="row">
+      <button id="voiceBtn" class="btn outline">🎤 वॉइस</button>
+      <button id="togglePlotsBtn" class="btn gray">GeoJSON छुपाएँ</button>
+    </div>
+    <div class="hint">Plot खोजने पर वह हाइलाइट और popup दिखेगा (Google Maps link)।</div>
+  </div>
+
+  <div class="sb-sec">
+    <div class="row">
+      <button id="locateBtn" class="btn">📍 मेरी लोकेशन</button>
+      <button id="fitBtn" class="btn outline">🗺️ पूरा मैप</button>
+    </div>
+    <div class="hint">लोकेशन के लिए ब्राउज़र परमिशन Allow करें।</div>
+  </div>
+
+  <div class="sb-sec">
+    <div class="row">
+      <button id="labelsToggle" class="btn outline">लेबल छुपाएँ</button>
+      <button id="speechToggle" class="btn gray">बोलना: चालू</button>
+    </div>
+    <div class="hint">लेबल्स और TTS Toggle।</div>
+  </div>
+
+  <div class="sb-sec">
+    <div class="row">
+      <button id="startMeasureBtn" class="btn orange">📐 Start Measure</button>
+      <button id="finishMeasureBtn" class="btn outline" disabled>✔ Finish</button>
+      <button id="clearMeasureBtn" class="btn gray">Clear</button>
+    </div>
+    <div id="measureInfo" class="hint">Start पर क्लिक करके पॉइंट जोड़ें। Finish पर नाप पूरा होगा।</div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<!-- libs -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+<script>
+/* ========= CONFIG ========= */
+const GEOJSON_URL = 'plots.geojson'; // <-- GitHub पर अपनी file का path/ raw link डालो
+const PLOT_PROP = 'Name';
+const MAX_ZOOM = 21;
+
+/* ========= MAP ========= */
+const map = L.map('map', { maxZoom: MAX_ZOOM, zoomControl: true }).setView([25.339365, 85.765942], 18);
+
+// Satellite base
+const sat = L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', { subdomains: ['mt0', 'mt1', 'mt2', 'mt3'], maxZoom: MAX_ZOOM }).addTo(map);
+
+/* ========= STATE ========= */
+let geoLayer = L.geoJSON(null, { style: f => ({ color: '#ff9800', weight: 1.6, fillOpacity: 0.08 }), onEachFeature }).addTo(map);
+let labelLayer = L.layerGroup().addTo(map);
+let geoOverlayVisible = true; // Renamed from plotsVisible to clarify it controls only GeoJSON overlay
+let dataCache = null;
+let youMarker = null;
+let highlightLayer = null;
+let speechOn = true;
+
+/* ========= UI HELPERS ========= */
+const sidebar = document.getElementById('sidebar');
+const menuBtn = document.getElementById('menuBtn');
+const toastEl = document.getElementById('toast');
+function toast(msg, ms = 2000) {
+  toastEl.innerText = msg;
+  toastEl.style.display = 'block';
+  clearTimeout(window._tt);
+  window._tt = setTimeout(() => toastEl.style.display = 'none', ms);
+}
+function speak(text) {
+  if (!speechOn) return;
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'hi-IN';
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(u);
+  } catch (e) {}
+}
+
+/* ========= LOAD GEOJSON ========= */
+fetch(GEOJSON_URL)
+  .then(r => {
+    if (!r.ok) throw new Error('GeoJSON load error ' + r.status);
+    return r.json();
+  })
+  .then(j => {
+    dataCache = j;
+    geoLayer.addData(j);
+    buildLabels(j);
+    const b = geoLayer.getBounds();
+    if (b.isValid()) map.fitBounds(b, { padding: [20, 20] });
+    toast('Plots loaded');
+  })
+  .catch(err => {
+    console.error(err);
+    toast('GeoJSON error: ' + err.message, 3000);
+  });
+
+function onEachFeature(feature, layer) {
+  const plotNo = feature?.properties?.[PLOT_PROP] ?? 'Unknown';
+  let areaTxt = 'N/A';
+  try {
+    areaTxt = (turf.area(feature) * 10.7639104167).toFixed(1);
+  } catch (e) {}
+  let centroid = [0, 0];
+  try {
+    const c = turf.centroid(feature).geometry.coordinates;
+    centroid = [c[1], c[0]];
+  } catch (e) {}
+  const popup = `<b>Plot:</b> ${plotNo}<br/><b>Area:</b> ${areaTxt} sq ft<br/><a href="https://www.google.com/maps/search/?api=1&query=${centroid[0]},${centroid[1]}" target="_blank">Open in Google Maps</a>`;
+  layer.bindPopup(popup);
+  layer.on('click', () => {
+    showFeatureInfo(feature, layer, true);
+  });
+}
+
+/* ========= LABELS ========= */
+function buildLabels(geojson) {
+  labelLayer.clearLayers();
+  (geojson.features || []).forEach(f => {
+    try {
+      const name = f?.properties?.[PLOT_PROP] ?? '';
+      const c = turf.centroid(f).geometry.coordinates;
+      const m = L.marker([c[1], c[0]], { icon: L.divIcon({ className: 'plot-label', html: `<div>${name}</div>` }) });
+      labelLayer.addLayer(m);
+    } catch (e) {}
+  });
+}
+
+/* ========= FEATURE INFO ========= */
+function showFeatureInfo(feature, layer, openPopup = true) {
+  const plotNo = feature?.properties?.[PLOT_PROP] ?? 'Unknown';
+  const areaSqFt = (turf.area(feature) * 10.7639104167).toFixed(1);
+  let c = [0, 0];
+  try {
+    const cent = turf.centroid(feature).geometry.coordinates;
+    c = [cent[1], cent[0]];
+  } catch (e) {}
+  const html = `<b>Plot:</b> ${plotNo}<br><b>Area:</b> ${areaSqFt} sq ft<br><a href="https://www.google.com/maps/search/?api=1&query=${c[0]},${c[1]}" target="_blank">Open in Google Maps</a>`;
+  if (openPopup) L.popup({ maxWidth: 320 }).setLatLng([c[0], c[1]]).setContent(html).openOn(map);
+  if (highlightLayer) map.removeLayer(highlightLayer);
+  highlightLayer = L.geoJSON(feature, { style: { color: '#00bfa5', weight: 3, fillOpacity: 0.25 } }).addTo(map);
+  speak(`आप प्लॉट नंबर ${plotNo} में हैं। इसका क्षेत्रफल ${Math.round(areaSqFt)} वर्ग फुट है।`);
+}
+
+/* ========= SIDEBAR TOGGLE ========= */
+menuBtn.addEventListener('click', () => {
+  const open = sidebar.classList.toggle('open');
+  sidebar.setAttribute('aria-hidden', open ? 'false' : 'true');
+});
+
+/* ========= PLOT SEARCH ========= */
+document.getElementById('searchBtn').addEventListener('click', () => {
+  const v = document.getElementById('plotInput').value.trim();
+  if (!v) {
+    toast('कृपया प्लॉट नंबर डालें');
+    return;
+  }
+  let found = false;
+  geoLayer.eachLayer(l => {
+    const pn = l.feature?.properties?.[PLOT_PROP];
+    if (String(pn) === String(v)) {
+      found = true;
+      map.fitBounds(l.getBounds(), { padding: [20, 20] });
+      showFeatureInfo(l.feature, l, true);
+    }
+  });
+  if (!found) {
+    toast('Plot not found');
+    speak(`प्लॉट नंबर ${v} नहीं मिला`);
+  }
+});
+
+/* ========= VOICE SEARCH ========= */
+document.getElementById('voiceBtn').addEventListener('click', () => {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    toast('वॉइस सर्च ब्राउज़र में उपलब्ध नहीं');
+    return;
+  }
+  const r = new SR();
+  r.lang = 'hi-IN';
+  r.onresult = (ev) => {
+    const text = ev.results[0][0].transcript;
+    document.getElementById('plotInput').value = text;
+    document.getElementById('searchBtn').click();
+  };
+  r.onerror = () => toast('Speech error');
+  r.start();
+});
+
+/* ========= TOGGLE GEOJSON OVERLAY (MODIFIED) ========= */
+document.getElementById('togglePlotsBtn').addEventListener('click', (e) => {
+  geoOverlayVisible = !geoOverlayVisible;
+  if (geoOverlayVisible) {
+    map.addLayer(geoLayer);
+    toast('GeoJSON दिख रहा है');
+    e.target.innerText = 'GeoJSON छुपाएँ';
+  } else {
+    if (map.hasLayer(geoLayer)) map.removeLayer(geoLayer);
+    toast('GeoJSON छुप गया');
+    e.target.innerText = 'GeoJSON दिखाएँ';
+  }
+});
+
+/* ========= TOGGLE LABELS ========= */
+document.getElementById('labelsToggle').addEventListener('click', (e) => {
+  if (map.hasLayer(labelLayer)) {
+    map.removeLayer(labelLayer);
+    e.target.innerText = 'लेबल दिखाएँ';
+    toast('लेबल छुप गए');
+  } else {
+    map.addLayer(labelLayer);
+    e.target.innerText = 'लेबल छुपाएँ';
+    toast('लेबल दिख रहे हैं');
+  }
+});
+
+/* ========= LOCATE & FIT ========= */
+document.getElementById('locateBtn').addEventListener('click', () => {
+  if (!navigator.geolocation) {
+    toast('Geolocation उपलब्ध नहीं');
+    return;
+  }
+  toast('लोकेशन मांगी जा रही है...');
+  navigator.geolocation.getCurrentPosition(
+    pos => {
+      const lat = pos.coords.latitude, lng = pos.coords.longitude;
+      if (youMarker) youMarker.setLatLng([lat, lng]);
+      else youMarker = L.circleMarker([lat, lng], { radius: 7, color: '#1976d2', fillColor: '#1976d2', fillOpacity: 1 }).addTo(map);
+      map.setView([lat, lng], Math.min(MAX_ZOOM, 19));
+    },
+    err => { toast('लोकेशन एरर: ' + (err.message || err.code)); },
+    { enableHighAccuracy: true, timeout: 15000 }
+  );
+});
+
+document.getElementById('fitBtn').addEventListener('click', () => {
+  const b = geoLayer.getBounds();
+  if (b.isValid()) map.fitBounds(b, { padding: [20, 20] });
+});
+
+/* ========= TTS TOGGLE ========= */
+document.getElementById('speechToggle').addEventListener('click', (e) => {
+  speechOn = !speechOn;
+  e.target.innerText = speechOn ? 'बोलना: चालू' : 'बोलना: बंद';
+  if (!speechOn) window.speechSynthesis.cancel();
+});
+
+/* ========= MEASURE TOOL ========= */
+let measuring = false;
+let pts = [];
+let markers = [];
+let previewPoly = null;
+let resultLabel = null;
+
+const startBtn = document.getElementById('startMeasureBtn');
+const finishBtn = document.getElementById('finishMeasureBtn');
+const clearBtn = document.getElementById('clearMeasureBtn');
+const measureInfo = document.getElementById('measureInfo');
+
+function startMeasure() {
+  measuring = true;
+  clearMeasure(true);
+  measureInfo.innerText = 'Measure ON — क्लिक कर पॉइंट जोड़ें। जब तैयार हों, Finish दबाएँ।';
+  startBtn.innerText = 'Measuring...';
+  startBtn.disabled = true;
+  finishBtn.disabled = false;
+}
+
+function finishMeasure() {
+  if (pts.length < 3) {
+    toast('कम से कम 3 पॉइंट चाहिए');
+    return;
+  }
+  const poly = turf.polygon([[...pts, pts[0]]]);
+  const area_m2 = turf.area(poly);
+  const area_sqft = area_m2 * 10.7639104167;
+  let c = turf.centroid(poly).geometry.coordinates;
+  if (previewPoly) map.removeLayer(previewPoly);
+  previewPoly = L.polygon([...pts.map(p => [p[1], p[0]]), [pts[0][1], pts[0][0]]], { color: '#ea580c', weight: 2, fillOpacity: 0.15 }).addTo(map);
+  if (resultLabel) map.removeLayer(resultLabel);
+  resultLabel = L.marker([c[1], c[0]], { icon: L.divIcon({ className: '', html: `<div class="measure-label"><b>Area:</b> ${area_sqft.toFixed(1)} sq ft</div>` }) }).addTo(map);
+  measureInfo.innerText = `Final Area: ${area_sqft.toFixed(1)} sq ft`;
+  toast(`Area: ${Math.round(area_sqft)} sq ft`);
+  speak(`एरिया ${Math.round(area_sqft)} वर्ग फुट`);
+  measuring = false;
+  startBtn.innerText = '📐 Start Measure';
+  startBtn.disabled = false;
+  finishBtn.disabled = true;
+}
+
+function clearMeasure(showMsg = false) {
+  pts = [];
+  markers.forEach(m => map.removeLayer(m));
+  markers = [];
+  if (previewPoly) {
+    map.removeLayer(previewPoly);
+    previewPoly = null;
+  }
+  if (resultLabel) {
+    map.removeLayer(resultLabel);
+    resultLabel = null;
+  }
+  measureInfo.innerText = 'क्लियर — नया नाप शुरू करें।';
+  if (showMsg) toast('Measure cleared', 1400);
+  finishBtn.disabled = true;
+  startBtn.disabled = false;
+  startBtn.innerText = '📐 Start Measure';
+}
+
+startBtn.addEventListener('click', startMeasure);
+finishBtn.addEventListener('click', finishMeasure);
+clearBtn.addEventListener('click', () => clearMeasure(true));
+
+map.on('click', function (e) {
+  if (!measuring) return;
+  const lat = e.latlng.lat, lng = e.latlng.lng;
+  const m = L.circleMarker([lat, lng], { radius: 5, color: '#111', fillColor: '#111', fillOpacity: 1 }).addTo(map);
+  markers.push(m);
+  pts.push([lng, lat]);
+  if (pts.length >= 3) {
+    if (previewPoly) map.removeLayer(previewPoly);
+    const ring = [...pts, pts[0]];
+    previewPoly = L.polygon(ring.map(p => [p[1], p[0]]), { color: '#ea580c', weight: 2, fillOpacity: 0.12 }).addTo(map);
+    const poly = turf.polygon([ring]);
+    const area_m2 = turf.area(poly);
+    const area_sqft = area_m2 * 10.7639104167;
+    const c = turf.centroid(poly).geometry.coordinates;
+    if (resultLabel) map.removeLayer(resultLabel);
+    resultLabel = L.marker([c[1], c[0]], { icon: L.divIcon({ className: '', html: `<div class="measure-label">Area: ${area_sqft.toFixed(1)} sq ft</div>` }) }).addTo(map);
+    measureInfo.innerText = `Live Area: ${area_sqft.toFixed(1)} sq ft — Finish पर क्लिक करें`;
+  } else {
+    measureInfo.innerText = `Points: ${pts.length} — कम से कम 3 पॉइंट चाहिए`;
+  }
+});
+
+/* ========= Prevent map zoom on double-click during measure ========= */
+map.doubleClickZoom.disable();
+
+/* ========= Prevent accidental map movements while using sidebar ========= */
+menuBtn.addEventListener('mousedown', () => L.DomEvent.stopPropagation(menuBtn));
+
+/* ========== END ========= */
+</script>
+</body>
+</html>
